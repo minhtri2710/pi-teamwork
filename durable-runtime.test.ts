@@ -28,3 +28,22 @@ test("no-session runtime uses memory storage and shares concurrent opens", async
   await closeDurableRuntime(ctx, "pi-teamwork-test");
   assert.equal(await hasDurableRuntime(ctx, "pi-teamwork-test"), false);
 });
+
+test("waitForWorkflow resolves on the committed change, and stops on abort", async () => {
+  const { Workflows, waitForWorkflow } = await import("./index.ts");
+  const ctx = context(`memory-${crypto.randomUUID()}`);
+  const runtime = await getDurableRuntime(ctx, "pi-teamwork-test");
+  const workflow = { id: "w1", mode: "single", provider: "p", modelId: "m", thinkingLevel: "medium", cwd: "/", tasks: [{ role: "scout", task: "t", instructions: "i", tools: ["read"], status: "running" }], status: "running" } as any;
+  await runtime.harness.commit(async (tx) => { (await tx.doc(Workflows)).workflows.push(workflow); }, BACKGROUND_CONTEXT);
+  const updates: string[] = [];
+  const done = waitForWorkflow(runtime, "w1", undefined, (event) => updates.push(event.details.status));
+  await runtime.harness.commit(async (tx) => { const item = (await tx.doc(Workflows)).workflows[0]; item.tasks[0].status = "done"; item.status = "done"; }, BACKGROUND_CONTEXT);
+  assert.equal((await done).status, "done");
+  assert.deepEqual(updates, ["running", "done"]);
+  await runtime.harness.commit(async (tx) => { (await tx.doc(Workflows)).workflows.push({ ...workflow, id: "w2" }); }, BACKGROUND_CONTEXT);
+  const controller = new AbortController();
+  const stopped = waitForWorkflow(runtime, "w2", controller.signal);
+  controller.abort();
+  await assert.rejects(stopped, /continues in the background/);
+  await closeDurableRuntime(ctx, "pi-teamwork-test");
+});

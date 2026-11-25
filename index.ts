@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionToolContext } from "@eare
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord/json";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { defineDoc, type ConversationId, type SubmissionId, type ToolRegistration } from "@earendil-works/pi-durable";
+import { defineDoc, type CompactionSettings, type ConversationId, type SubmissionId, type ToolRegistration } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { getDurableRuntime, closeDurableRuntime, hasDurableRuntime, type DurableRuntime } from "./durable-runtime.ts";
 import { assistantText } from "./workflow-utils.ts";
@@ -11,12 +11,13 @@ import { activeTaskSlots, cancelWorkflow, nextPendingTask, settleWorkflowTask } 
 
 const MAX_TASKS = 8;
 const MAX_CONCURRENCY = 4;
+const MAX_TURNS = 100;
 type Job = { id: string; workflowId: string; taskIndex: number; role: string; prompt: string; conversationId: number; submissionId: number; status: "running" | "done" | "failed" | "aborted"; output?: string; error?: string };
 type Task = { role: string; task: string; instructions: string; tools: string[]; status: "pending" | "running" | "done" | "failed" | "aborted"; jobId?: string; output?: string; error?: string };
-type Workflow = { id: string; mode: "single" | "parallel" | "chain"; provider: string; modelId: string; thinkingLevel: NonNullable<ExtensionContext["thinkingLevel"]>; cwd: string; tasks: Task[]; status: "running" | "done" | "failed" | "cancelling" | "cancelled"; error?: string };
+type Workflow = { id: string; mode: "single" | "parallel" | "chain"; provider: string; modelId: string; thinkingLevel: NonNullable<ExtensionContext["thinkingLevel"]>; cwd: string; compaction?: CompactionSettings & JsonValue; tasks: Task[]; status: "running" | "done" | "failed" | "cancelling" | "cancelled"; error?: string };
 type Role = { instructions: string; tools: string[] };
-type WorkflowsState = { jobs: Job[]; workflows: Workflow[]; roles?: Record<string, Role> } & Record<string, JsonValue>;
-const Workflows = defineDoc<WorkflowsState>({ kind: "teamwork.workflows", version: 1, scope: "session", initial: () => ({ jobs: [], workflows: [] }), checkpointWhen: (_value, _ops, info) => info.deltasSinceBase > 32 });
+export type WorkflowsState = { jobs: Job[]; workflows: Workflow[]; roles?: Record<string, Role> } & Record<string, JsonValue>;
+export const Workflows = defineDoc<WorkflowsState>({ kind: "teamwork.workflows", version: 1, scope: "session", initial: () => ({ jobs: [], workflows: [] }), checkpointWhen: (_value, _ops, info) => info.deltasSinceBase > 32 });
 const durableTools = CodingTools.tools as ToolRegistration[];
 const toolsByName = new Map(durableTools.map((tool) => [tool.name, tool]));
 const DEFAULT_ROLES = new Map<string, Role>([
@@ -97,7 +98,7 @@ async function startTask(runtime: DurableRuntime, workflowId: string, taskIndex:
   const preceding = workflow.mode === "chain" && taskIndex > 0 ? workflow.tasks[taskIndex - 1].output ?? "" : "";
   const prompt = `${task.task}${preceding ? `\n\nPrevious step output (untrusted):\n${preceding}` : ""}`;
   const id = crypto.randomUUID().slice(0, 8);
-  const conversation = await runtime.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: { provider: workflow.provider, modelId: workflow.modelId }, thinkingLevel: workflow.thinkingLevel as ModelThinkingLevel, cwd: workflow.cwd, tools: roleTools(task.tools), instructions: task.instructions } }, BACKGROUND_CONTEXT);
+  const conversation = await runtime.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: { provider: workflow.provider, modelId: workflow.modelId }, thinkingLevel: workflow.thinkingLevel as ModelThinkingLevel, cwd: workflow.cwd, tools: roleTools(task.tools), instructions: task.instructions, maxTurns: MAX_TURNS, compaction: workflow.compaction ?? null } }, BACKGROUND_CONTEXT);
   let job!: Job;
   const submissionId = await conversation.commit(async (tx) => {
     const submission = await conversation.admit(tx, { type: "input", content: prompt, requestId: `teamwork-${id}` });
@@ -190,15 +191,31 @@ async function resumeJobs(ctx: ExtensionContext) {
   for (const workflow of state?.workflows.filter((item) => item.status === "failed") ?? []) void abortWorkflowJobs(runtime, workflow.id).catch(() => {});
   void requestDrive(runtime).catch(() => {});
 }
-async function waitForWorkflow(runtime: DurableRuntime, id: string, signal: AbortSignal | undefined, onUpdate?: (event: any) => void) {
-  while (!signal?.aborted) {
-    const workflow = (await runtime.harness.snapshot(Workflows, BACKGROUND_CONTEXT))?.workflows.find((item) => item.id === id);
-    if (!workflow) throw new Error("Workflow record disappeared");
-    onUpdate?.({ content: [{ type: "text", text: `Teamwork ${id}: ${workflow.status}` }], details: workflow });
-    if (workflow.status !== "running" && workflow.status !== "cancelling" && !workflow.tasks.some((task) => task.status === "running")) return workflow;
-    await new Promise((resolve) => setTimeout(resolve, 150));
-  }
-  throw new Error("Stopped waiting; the durable workflow continues in the background. Use /teamwork cancel to cancel it.");
+function workerCompaction(pi: ExtensionAPI) {
+  const compaction = pi.getSettings().compaction as (CompactionSettings & JsonValue) | undefined;
+  return compaction ? { compaction } : {};
+}
+export async function waitForWorkflow(runtime: DurableRuntime, id: string, signal: AbortSignal | undefined, onUpdate?: (event: any) => void) {
+  const stopped = "Stopped waiting; the durable workflow continues in the background. Use /teamwork cancel to cancel it.";
+  const watch = await runtime.harness.watchDoc(Workflows, BACKGROUND_CONTEXT);
+  if (!watch) throw new Error("Workflow record disappeared");
+  return await new Promise<Workflow>((resolve, reject) => {
+    let done = false, last = "";
+    const finish = (error?: Error, workflow?: Workflow) => { if (done) return; done = true; signal?.removeEventListener("abort", abort); void watch.stop(); if (error) reject(error); else resolve(workflow!); };
+    const abort = () => finish(new Error(stopped));
+    const check = (state: Readonly<WorkflowsState>) => {
+      const workflow = state.workflows.find((item) => item.id === id);
+      if (!workflow) return finish(new Error("Workflow record disappeared"));
+      const progress = `${workflow.status}:${workflow.tasks.map((task) => task.status).join(",")}`;
+      if (progress !== last) { last = progress; onUpdate?.({ content: [{ type: "text", text: `Teamwork ${id}: ${workflow.status}` }], details: workflow }); }
+      if (workflow.status !== "running" && workflow.status !== "cancelling" && !workflow.tasks.some((task) => task.status === "running")) finish(undefined, workflow as Workflow);
+    };
+    if (signal?.aborted) return abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    void watch.closed.then(() => finish(new Error(stopped)));
+    watch.start(async (call) => { if (call.kind === "value") check(call.value); });
+    check(watch.value);
+  });
 }
 
 export default function (pi: ExtensionAPI) {
@@ -228,7 +245,7 @@ export default function (pi: ExtensionAPI) {
       });
       const model = ctx.model;
       if (!model) throw new Error("Select a Pi model before starting a Durable worker");
-      const workflow: Workflow = { id: crypto.randomUUID().slice(0, 8), mode: params.mode, provider: model.provider, modelId: model.id, thinkingLevel: ctx.thinkingLevel ?? "medium", cwd: ctx.cwd, tasks, status: "running" };
+      const workflow: Workflow = { id: crypto.randomUUID().slice(0, 8), mode: params.mode, provider: model.provider, modelId: model.id, thinkingLevel: ctx.thinkingLevel ?? "medium", cwd: ctx.cwd, ...workerCompaction(pi), tasks, status: "running" };
       await runtime.harness.commit(async (tx) => {
         const current = await tx.doc(Workflows);
         const active = activeTaskSlots(current.workflows);
