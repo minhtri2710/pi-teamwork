@@ -100,7 +100,7 @@ async function startTask(runtime: DurableRuntime, workflowId: string, taskIndex:
   const conversation = await runtime.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: { provider: workflow.provider, modelId: workflow.modelId }, thinkingLevel: workflow.thinkingLevel as ModelThinkingLevel, cwd: workflow.cwd, tools: roleTools(task.tools), instructions: task.instructions } }, BACKGROUND_CONTEXT);
   let job!: Job;
   const submissionId = await conversation.commit(async (tx) => {
-    const submission = await conversation.submit(tx, { type: "input", content: prompt, requestId: `teamwork-${id}` });
+    const submission = await conversation.admit(tx, { type: "input", content: prompt, requestId: `teamwork-${id}` });
     const currentState = await tx.doc(Workflows);
     const current = currentState.workflows.find((item) => item.id === workflowId);
     const currentTask = current?.tasks[taskIndex];

@@ -6,8 +6,8 @@
   "keywords": ["pi-package"],
   "license": "MIT",
   "dependencies": {
-    "@earendil-works/chord": "1.5.2",
-    "@earendil-works/pi-durable": "1.5.2"
+    "@earendil-works/chord": "1.6.1",
+    "@earendil-works/pi-durable": "1.6.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
