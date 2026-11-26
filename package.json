@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "description": "Durable one-level Pi task delegation and staged workflows.",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "dependencies": {
     "@earendil-works/chord": "1.6.1",
@@ -15,9 +17,18 @@
     "typebox": "*"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "devDependencies": {
-    "typebox": "1.4.7"
+    "@earendil-works/pi-coding-agent": "1.6.1",
+    "@types/node": "^22.19.0",
+    "typebox": "1.4.7",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "test": "node --test *.test.ts",
+    "typecheck": "tsc -p ."
   }
 }
