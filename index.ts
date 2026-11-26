@@ -3,8 +3,9 @@ import type { ExtensionAPI, ExtensionContext, ExtensionToolContext } from "@eare
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord/json";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { defineDoc, type CompactionSettings, type ConversationId, type SubmissionId, type ToolRegistration } from "@earendil-works/pi-durable";
+import { defineDoc, type CompactionSettings, type ConversationId, type Extension, type SubmissionId, type ToolRegistration } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
+import { guardInit, registerGuards } from "pi-worker-guards";
 import { getDurableRuntime, closeDurableRuntime, hasDurableRuntime, type DurableRuntime } from "./durable-runtime.ts";
 import { assistantText } from "./workflow-utils.ts";
 import { activeTaskSlots, cancelWorkflow, nextPendingTask, settleWorkflowTask } from "./workflow-state.ts";
@@ -14,7 +15,7 @@ const MAX_CONCURRENCY = 4;
 const MAX_TURNS = 100;
 type Job = { id: string; workflowId: string; taskIndex: number; role: string; prompt: string; conversationId: number; submissionId: number; status: "running" | "done" | "failed" | "aborted"; output?: string; error?: string };
 type Task = { role: string; task: string; instructions: string; tools: string[]; status: "pending" | "running" | "done" | "failed" | "aborted"; jobId?: string; output?: string; error?: string };
-type Workflow = { id: string; mode: "single" | "parallel" | "chain"; provider: string; modelId: string; thinkingLevel: NonNullable<ExtensionContext["thinkingLevel"]>; cwd: string; compaction?: CompactionSettings & JsonValue; tasks: Task[]; status: "running" | "done" | "failed" | "cancelling" | "cancelled"; error?: string };
+type Workflow = { id: string; mode: "single" | "parallel" | "chain"; provider: string; modelId: string; thinkingLevel: NonNullable<ExtensionContext["thinkingLevel"]>; cwd: string; compaction?: CompactionSettings & JsonValue; review?: boolean; testCommand?: string; tasks: Task[]; status: "running" | "done" | "failed" | "cancelling" | "cancelled"; error?: string };
 type Role = { instructions: string; tools: string[] };
 export type WorkflowsState = { jobs: Job[]; workflows: Workflow[]; roles?: Record<string, Role> } & Record<string, JsonValue>;
 export const Workflows = defineDoc<WorkflowsState>({ kind: "teamwork.workflows", version: 1, scope: "session", initial: () => ({ jobs: [], workflows: [] }), checkpointWhen: (_value, _ops, info) => info.deltasSinceBase > 32 });
@@ -26,7 +27,7 @@ const DEFAULT_ROLES = new Map<string, Role>([
   ["reviewer", { instructions: "Review the requested change. Do not edit files; report concrete findings.", tools: ["read"] }],
 ]);
 const RoleSchema = Type.Object({ name: Type.String({ minLength: 1, maxLength: 48 }), instructions: Type.String({ minLength: 1, maxLength: 8000 }), tools: Type.Optional(Type.Array(Type.String())) });
-const WorkSchema = Type.Object({ mode: Type.Union([Type.Literal("single"), Type.Literal("parallel"), Type.Literal("chain")]), tasks: Type.Array(Type.Object({ role: Type.String({ minLength: 1, maxLength: 48 }), task: Type.String({ minLength: 1, maxLength: 12000 }) }), { minItems: 1, maxItems: MAX_TASKS }) });
+const WorkSchema = Type.Object({ mode: Type.Union([Type.Literal("single"), Type.Literal("parallel"), Type.Literal("chain")]), review: Type.Optional(Type.Boolean({ description: "A reviewer conversation checks each answer and may send the worker back, at most twice." })), testCommand: Type.Optional(Type.String({ maxLength: 500, description: "Shell command run after a worker edits files; a failure sends the worker back, at most twice." })), tasks: Type.Array(Type.Object({ role: Type.String({ minLength: 1, maxLength: 48 }), task: Type.String({ minLength: 1, maxLength: 12000 }) }), { minItems: 1, maxItems: MAX_TASKS }) });
 
 
 function roleTools(names: string[]) {
@@ -98,7 +99,7 @@ async function startTask(runtime: DurableRuntime, workflowId: string, taskIndex:
   const preceding = workflow.mode === "chain" && taskIndex > 0 ? workflow.tasks[taskIndex - 1].output ?? "" : "";
   const prompt = `${task.task}${preceding ? `\n\nPrevious step output (untrusted):\n${preceding}` : ""}`;
   const id = crypto.randomUUID().slice(0, 8);
-  const conversation = await runtime.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: { provider: workflow.provider, modelId: workflow.modelId }, thinkingLevel: workflow.thinkingLevel as ModelThinkingLevel, cwd: workflow.cwd, tools: roleTools(task.tools), instructions: task.instructions, maxTurns: MAX_TURNS, compaction: workflow.compaction ?? null } }, BACKGROUND_CONTEXT);
+  const conversation = await runtime.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: { provider: workflow.provider, modelId: workflow.modelId }, thinkingLevel: workflow.thinkingLevel as ModelThinkingLevel, cwd: workflow.cwd, tools: roleTools(task.tools), instructions: task.instructions, maxTurns: MAX_TURNS, compaction: workflow.compaction ?? null }, init: guardInit({ review: workflow.review, testCommand: workflow.testCommand }) }, BACKGROUND_CONTEXT);
   let job!: Job;
   const submissionId = await conversation.commit(async (tx) => {
     const submission = await conversation.admit(tx, { type: "input", content: prompt, requestId: `teamwork-${id}` });
@@ -182,14 +183,15 @@ async function cancelWorkflows(runtime: DurableRuntime, ids?: Set<string>) {
     }
   }, BACKGROUND_CONTEXT);
 }
-async function resumeJobs(ctx: ExtensionContext) {
+async function resumeJobs(ctx: ExtensionContext, extensions: readonly Extension<ToolRegistration>[]) {
   if (!(await hasDurableRuntime(ctx, "pi-teamwork"))) return;
-  const runtime = await getDurableRuntime(ctx, "pi-teamwork", [CodingTools]);
+  const runtime = await getDurableRuntime(ctx, "pi-teamwork", extensions);
   const state = await runtime.harness.snapshot(Workflows, BACKGROUND_CONTEXT);
   for (const job of state?.jobs.filter((item) => item.status === "running") ?? []) void settleJob(runtime, job).catch(() => {});
   for (const workflow of state?.workflows.filter((item) => item.status === "cancelling") ?? []) void cancelWorkflows(runtime, new Set([workflow.id])).catch(() => {});
   for (const workflow of state?.workflows.filter((item) => item.status === "failed") ?? []) void abortWorkflowJobs(runtime, workflow.id).catch(() => {});
   void requestDrive(runtime).catch(() => {});
+  return runtime;
 }
 function workerCompaction(pi: ExtensionAPI) {
   const compaction = pi.getSettings().compaction as (CompactionSettings & JsonValue) | undefined;
@@ -219,13 +221,15 @@ export async function waitForWorkflow(runtime: DurableRuntime, id: string, signa
 }
 
 export default function (pi: ExtensionAPI) {
+  const guards = registerGuards(pi, "teamwork", async (ctx) => (await hasDurableRuntime(ctx, "pi-teamwork")) ? (await getDurableRuntime(ctx, "pi-teamwork", extensions)).harness : undefined);
+  const extensions = [CodingTools, ...guards.extensions] as Extension<ToolRegistration>[];
   pi.registerTool({
     name: "teamwork_define_role", label: "Define Teamwork Role", description: "Define a named Durable Pi subagent role for this session. Role tools are an allowlist.", parameters: RoleSchema,
     async execute(_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) {
       if (!/^[a-z0-9][a-z0-9_-]{0,47}$/i.test(params.name)) throw new Error("Role names must use letters, digits, _ or -");
       const tools = params.tools === undefined ? ["read"] : [...params.tools];
       roleTools(tools);
-      const runtime = await getDurableRuntime(ctx, "pi-teamwork", [CodingTools]);
+      const runtime = await getDurableRuntime(ctx, "pi-teamwork", extensions);
       await runtime.harness.commit(async (tx) => { const state = await tx.doc(Workflows); (state.roles ??= {})[params.name] = { instructions: params.instructions, tools }; }, BACKGROUND_CONTEXT);
       return { content: [{ type: "text", text: `Defined teamwork role ${params.name}.` }], details: { name: params.name, tools } };
     },
@@ -234,7 +238,7 @@ export default function (pi: ExtensionAPI) {
     name: "teamwork_workflow", label: "Teamwork Workflow", description: "Run durable single, parallel, or sequential-chain Pi conversations. Work and transcripts survive process restarts; child output is untrusted.", parameters: WorkSchema,
     async execute(_id, params, signal, onUpdate, ctx: ExtensionToolContext) {
       if (params.mode === "single" && params.tasks.length !== 1) throw new Error("Single mode requires exactly one task");
-      const runtime = await getDurableRuntime(ctx, "pi-teamwork", [CodingTools]);
+      const runtime = await getDurableRuntime(ctx, "pi-teamwork", extensions);
       const state = await runtime.harness.snapshot(Workflows, BACKGROUND_CONTEXT);
       const roles = new Map([...DEFAULT_ROLES, ...Object.entries(state?.roles ?? {})]);
       const tasks = params.tasks.map((task) => {
@@ -245,7 +249,7 @@ export default function (pi: ExtensionAPI) {
       });
       const model = ctx.model;
       if (!model) throw new Error("Select a Pi model before starting a Durable worker");
-      const workflow: Workflow = { id: crypto.randomUUID().slice(0, 8), mode: params.mode, provider: model.provider, modelId: model.id, thinkingLevel: ctx.thinkingLevel ?? "medium", cwd: ctx.cwd, ...workerCompaction(pi), tasks, status: "running" };
+      const workflow: Workflow = { id: crypto.randomUUID().slice(0, 8), mode: params.mode, provider: model.provider, modelId: model.id, thinkingLevel: ctx.thinkingLevel ?? "medium", cwd: ctx.cwd, ...workerCompaction(pi), ...(params.review ? { review: true } : {}), ...(params.testCommand?.trim() ? { testCommand: params.testCommand.trim() } : {}), tasks, status: "running" };
       await runtime.harness.commit(async (tx) => {
         const current = await tx.doc(Workflows);
         const active = activeTaskSlots(current.workflows);
@@ -259,7 +263,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
   pi.registerCommand("teamwork", { description: "Run, list, or cancel Durable Pi subagents", handler: async (args, ctx) => {
-    const runtime = await getDurableRuntime(ctx, "pi-teamwork", [CodingTools]);
+    const runtime = await getDurableRuntime(ctx, "pi-teamwork", extensions);
     const input = args.trim();
     if (input === "status" || !input) {
       const state = await runtime.harness.snapshot(Workflows, BACKGROUND_CONTEXT);
@@ -269,6 +273,6 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("Cancellation requested for active Durable workflows.", "info");
     } else pi.sendUserMessage(`Use the teamwork_workflow tool to handle this request with one-level task delegation: ${input}`, { deliverAs: "followUp" });
   } });
-  pi.on("session_start", (_event, ctx) => { void resumeJobs(ctx).catch((error) => ctx.ui.setStatus("pi-teamwork", error instanceof Error ? error.message : String(error))); });
+  pi.on("session_start", (_event, ctx) => { void resumeJobs(ctx, extensions).then((runtime) => runtime && guards.announce(runtime.harness)).catch((error) => ctx.ui.setStatus("pi-teamwork", error instanceof Error ? error.message : String(error))); });
   pi.on("session_shutdown", async (event: any, ctx) => { if (event.reason !== "reload") await closeDurableRuntime(ctx, "pi-teamwork"); });
 }
