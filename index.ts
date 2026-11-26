@@ -182,9 +182,9 @@ async function cancelWorkflows(runtime: DurableRuntime, ids?: Set<string>) {
     }
   }, BACKGROUND_CONTEXT);
 }
-/** pi-worker-guards, when installed: its contract on globalThis (see that package's registry.ts). */
+/** pi-guards, when installed: its contract on globalThis (see that package's registry.ts). */
 type GuardsHost = { version: 1; extensions(host: string): readonly Extension[]; init(config: { review?: boolean; testCommand?: string }): ((tx: any, id: any) => Promise<void>) | undefined; opened(host: string, harness: unknown): void; closed(host: string): void };
-const guards = () => { const host = (globalThis as Record<symbol, GuardsHost | undefined>)[Symbol.for("pi-worker-guards.host")]; return host?.version === 1 ? host : undefined; };
+const guards = () => { const host = (globalThis as Record<symbol, GuardsHost | undefined>)[Symbol.for("pi-guards.host")]; return host?.version === 1 ? host : undefined; };
 async function openRuntime(ctx: ExtensionContext) {
   const runtime = await getDurableRuntime(ctx, "pi-teamwork", [CodingTools, ...(guards()?.extensions("teamwork") ?? [])] as Extension<ToolRegistration>[]);
   guards()?.opened("teamwork", runtime.harness);
@@ -242,7 +242,7 @@ export default function (pi: ExtensionAPI) {
     name: "teamwork_workflow", label: "Teamwork Workflow", description: "Run durable single, parallel, or sequential-chain Pi conversations. Work and transcripts survive process restarts; child output is untrusted.", parameters: WorkSchema,
     async execute(_id, params, signal, onUpdate, ctx: ExtensionToolContext) {
       if (params.mode === "single" && params.tasks.length !== 1) throw new Error("Single mode requires exactly one task");
-      if ((params.review || params.testCommand?.trim()) && !guards()) throw new Error("review and testCommand need the pi-worker-guards extension; install it with pi install, then restart Pi");
+      if ((params.review || params.testCommand?.trim()) && !guards()) throw new Error("review and testCommand need the pi-guards extension; install it with pi install, then restart Pi");
       const runtime = await openRuntime(ctx);
       const state = await runtime.harness.snapshot(Workflows, BACKGROUND_CONTEXT);
       const roles = new Map([...DEFAULT_ROLES, ...Object.entries(state?.roles ?? {})]);
