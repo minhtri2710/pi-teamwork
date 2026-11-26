@@ -47,3 +47,21 @@ test("waitForWorkflow resolves on the committed change, and stops on abort", asy
   await assert.rejects(stopped, /continues in the background/);
   await closeDurableRuntime(ctx, "pi-teamwork-test");
 });
+
+test("review and testCommand are refused without pi-worker-guards, and its guards join workers when it is installed", async () => {
+  const { default: teamwork } = await import("./index.ts");
+  const key = Symbol.for("pi-worker-guards.host");
+  const tools: Record<string, any> = {};
+  teamwork({ registerTool: (tool: any) => { tools[tool.name] = tool; }, registerCommand: () => {}, on: () => {}, getSettings: () => ({}) } as any);
+  const ctx = { ...context(`memory-${crypto.randomUUID()}`), model: { provider: "faux", id: "m" }, thinkingLevel: "medium" };
+  const run = (params: object) => tools.teamwork_workflow.execute("id", { mode: "single", tasks: [{ role: "scout", task: "t" }], ...params }, AbortSignal.abort(), undefined, ctx);
+  delete (globalThis as any)[key];
+  await assert.rejects(run({ review: true }), /pi-worker-guards/);
+  await assert.rejects(run({ testCommand: "npm test" }), /pi-worker-guards/);
+  const opened: string[] = [];
+  (globalThis as any)[key] = { version: 1, extensions: () => [], init: () => undefined, opened: (host: string) => opened.push(host), closed: () => {} };
+  await assert.rejects(run({ review: true }), /continues in the background/);
+  assert.deepEqual([...new Set(opened)], ["teamwork"]);
+  delete (globalThis as any)[key];
+  await closeDurableRuntime(ctx, "pi-teamwork");
+});

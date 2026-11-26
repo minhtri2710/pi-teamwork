@@ -7,8 +7,7 @@
   "license": "MIT",
   "dependencies": {
     "@earendil-works/chord": "1.6.1",
-    "@earendil-works/pi-durable": "1.6.1",
-    "pi-worker-guards": "file:../pi-worker-guards"
+    "@earendil-works/pi-durable": "1.6.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
