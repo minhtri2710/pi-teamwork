@@ -65,3 +65,45 @@ test("review and testCommand are refused without pi-guards, and its guards join 
   delete (globalThis as any)[key];
   await closeDurableRuntime(ctx, "pi-teamwork");
 });
+
+test("cancel aborts every job at once, so a long tool call holds no other worker's abort", async () => {
+  const { Workflows, cancelWorkflows } = await import("./index.ts");
+  const { defineExtension, defineTool } = await import("@earendil-works/pi-durable");
+  const { fauxAssistantMessage, fauxProvider, fauxToolCall } = await import("@earendil-works/pi-ai");
+  const { Type } = await import("typebox");
+  const ctx = context(`memory-${crypto.randomUUID()}`);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  // "hold" ignores its abort until released, as a command that traps TERM; "wait" ends on abort.
+  const Tools = defineExtension({ name: "test-tools", tools: [defineTool({ name: "work", description: "work", parameters: Type.Object({ mode: Type.String() }),
+    execute: async (args: any, _api: any, call: any) => {
+      if (args.mode === "hold") await held;
+      else await new Promise<void>((resolve) => { if (call.abortSignal?.aborted) resolve(); call.abortSignal?.addEventListener("abort", () => resolve(), { once: true }); });
+      return { output: [{ type: "text", text: "ok" }] };
+    } })] });
+  const runtime = await getDurableRuntime(ctx, "pi-teamwork-test", [Tools]);
+  const faux = fauxProvider();
+  runtime.models.setProvider(faux.provider);
+  faux.setResponses([fauxAssistantMessage([fauxToolCall("work", { mode: "hold" })], { stopReason: "toolUse" }), fauxAssistantMessage([fauxToolCall("work", { mode: "wait" })], { stopReason: "toolUse" }), fauxAssistantMessage("done"), fauxAssistantMessage("done")]);
+  const model = faux.getModel();
+  const worker = () => runtime.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: { provider: model.provider, modelId: model.id }, extensions: [Tools] } }, BACKGROUND_CONTEXT);
+  const slow = await worker(), other = await worker();
+  const slowSub = await slow.submit({ type: "input", content: "go" }, BACKGROUND_CONTEXT);
+  const running = async () => (await runtime.harness.inspect(BACKGROUND_CONTEXT)).tasks.filter(({ record }) => record.kind === "pi.tool" && record.state.status === "running").length;
+  while (await running() < 1) await new Promise((resolve) => setTimeout(resolve, 5));
+  const otherSub = await other.submit({ type: "input", content: "go" }, BACKGROUND_CONTEXT);
+  while (await running() < 2) await new Promise((resolve) => setTimeout(resolve, 5));
+  const job = (id: string, conversationId: number, submissionId: number, taskIndex: number) => ({ id, workflowId: "w", taskIndex, role: "worker", prompt: "go", conversationId, submissionId, status: "running" });
+  await runtime.harness.commit(async (tx) => {
+    const state = await tx.doc(Workflows);
+    state.workflows.push({ id: "w", mode: "parallel", provider: "p", modelId: "m", thinkingLevel: "medium", cwd: "/", status: "running",
+      tasks: [0, 1].map(() => ({ role: "worker", task: "go", instructions: "i", tools: [], status: "running" })) } as any);
+    state.jobs.push(job("a", slow.id, slowSub.id, 0) as any, job("b", other.id, otherSub.id, 1) as any);
+  }, BACKGROUND_CONTEXT);
+  const cancelled = cancelWorkflows(runtime);
+  const otherSettled = await Promise.race([otherSub.wait(BACKGROUND_CONTEXT).then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 2000))]);
+  release();
+  await cancelled;
+  assert.equal(otherSettled, true);
+  await closeDurableRuntime(ctx, "pi-teamwork-test");
+});

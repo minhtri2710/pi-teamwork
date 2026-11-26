@@ -150,35 +150,33 @@ function requestDrive(runtime: DurableRuntime): Promise<void> {
   void next.finally(() => { if (runtime.drive === next) runtime.drive = undefined; }).catch(() => {});
   return next;
 }
-async function abortWorkflowJobs(runtime: DurableRuntime, workflowId: string, exceptId?: string) {
-  const jobs = (await runtime.harness.snapshot(Workflows, BACKGROUND_CONTEXT))?.jobs.filter((job) => job.workflowId === workflowId && job.id !== exceptId && job.status === "running") ?? [];
-  for (const job of jobs) {
-    try {
-      const conversation = await runtime.harness.conversation(job.conversationId as ConversationId, BACKGROUND_CONTEXT);
-      await conversation?.abort(BACKGROUND_CONTEXT);
-    } catch { /* The worker may have settled while cancellation was being applied. */ }
-  }
+/** Aborts every job at once: an abort waits for its worker's running tool, so in turn one long call would hold the rest. */
+async function abortJobs(runtime: DurableRuntime, jobs: readonly Job[]) {
+  await Promise.allSettled(jobs.map(async (job) => {
+    const conversation = await runtime.harness.conversation(job.conversationId as ConversationId, BACKGROUND_CONTEXT);
+    await conversation?.abort(BACKGROUND_CONTEXT);
+  }));
 }
-async function cancelWorkflows(runtime: DurableRuntime, ids?: Set<string>) {
+async function abortWorkflowJobs(runtime: DurableRuntime, workflowId: string, exceptId?: string) {
+  await abortJobs(runtime, (await runtime.harness.snapshot(Workflows, BACKGROUND_CONTEXT))?.jobs.filter((job) => job.workflowId === workflowId && job.id !== exceptId && job.status === "running") ?? []);
+}
+export async function cancelWorkflows(runtime: DurableRuntime, ids?: Set<string>) {
   const selected = await runtime.harness.commit(async (tx) => {
     const state = await tx.doc(Workflows);
     const workflows = state.workflows.filter((workflow) => (workflow.status === "running" || workflow.status === "cancelling") && (!ids || ids.has(workflow.id)));
     for (const workflow of workflows) {
       cancelWorkflow(workflow);
     }
-    return { workflows, jobs: state.jobs.filter((job) => job.status === "running" && workflows.some((workflow) => workflow.id === job.workflowId)) };
+    // Plain copies: the document's values are unreadable once the transaction settles.
+    const chosen = workflows.map((workflow) => workflow.id);
+    return { ids: chosen, jobs: state.jobs.filter((job) => job.status === "running" && chosen.includes(job.workflowId)).map((job) => ({ ...job })) };
   }, BACKGROUND_CONTEXT);
-  for (const job of selected.jobs) {
-    try {
-      const conversation = await runtime.harness.conversation(job.conversationId as ConversationId, BACKGROUND_CONTEXT);
-      await conversation?.abort(BACKGROUND_CONTEXT);
-    } catch { /* The worker may have settled while cancellation was being applied. */ }
-  }
+  await abortJobs(runtime, selected.jobs);
   await runtime.harness.commit(async (tx) => {
     const state = await tx.doc(Workflows);
-    for (const workflow of selected.workflows) {
-      const current = state.workflows.find((item) => item.id === workflow.id);
-      if (current?.status === "cancelling" && !state.jobs.some((job) => job.workflowId === workflow.id && job.status === "running")) current.status = "cancelled";
+    for (const id of selected.ids) {
+      const current = state.workflows.find((item) => item.id === id);
+      if (current?.status === "cancelling" && !state.jobs.some((job) => job.workflowId === id && job.status === "running")) current.status = "cancelled";
     }
   }, BACKGROUND_CONTEXT);
 }
