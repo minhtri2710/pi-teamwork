@@ -5,8 +5,8 @@ Durable one-level Pi task delegation: one-shot tasks, bounded parallel fan-out, 
 ## Install
 
 ```sh
-cd ~/Work/pi-teamwork && npm install --legacy-peer-deps
-pi install ~/Work/pi-teamwork
+cd ~/Work/pi-extension/pi-teamwork && npm install --legacy-peer-deps
+pi install ~/Work/pi-extension/pi-teamwork
 ```
 
 Pi's local package installer does not install npm dependencies; run `npm install --legacy-peer-deps` in the package directory first. The package registers `teamwork_define_role`, `teamwork_workflow`, and `/teamwork <task|status|cancel>`. Default roles are `scout`, `worker`, and `reviewer`; define session-local roles with an explicit tool allowlist. Worker conversations use the selected Pi model and thinking level with the declared Durable tools; workers do not recursively delegate or launch a child Pi CLI process.
