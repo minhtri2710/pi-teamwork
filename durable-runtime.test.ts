@@ -59,7 +59,7 @@ test("review and testCommand are refused without pi-guards, and its guards join 
   await assert.rejects(run({ review: true }), /pi-guards/);
   await assert.rejects(run({ testCommand: "npm test" }), /pi-guards/);
   const opened: string[] = [];
-  (globalThis as any)[key] = { version: 1, extensions: () => [], init: () => undefined, opened: (host: string) => opened.push(host), closed: () => {} };
+  (globalThis as any)[key] = { version: 1, extensions: () => [], init: () => undefined, opened: (host: string) => opened.push(host), closed: () => {}, pending: async () => [] };
   await assert.rejects(run({ review: true }), /continues in the background/);
   assert.deepEqual([...new Set(opened)], ["teamwork"]);
   delete (globalThis as any)[key];
@@ -106,4 +106,41 @@ test("cancel aborts every job at once, so a long tool call holds no other worker
   await cancelled;
   assert.equal(otherSettled, true);
   await closeDurableRuntime(ctx, "pi-teamwork-test");
+});
+
+test("status names a parked approval and a stopped worker's uncommitted files", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { describeWorkflow } = await import("./index.ts");
+  const repo = await mkdtemp(join(tmpdir(), "teamwork-"));
+  try {
+    execFileSync("git", ["init", "-q", repo]);
+    await writeFile(join(repo, "a.txt"), "partial");
+    const ctx = context(`memory-${crypto.randomUUID()}`);
+    const runtime = await getDurableRuntime(ctx, "pi-teamwork-test");
+    const task = (status: string, jobId?: string) => ({ role: "worker", task: "t", instructions: "i", tools: [], status, ...(jobId ? { jobId } : {}) });
+    const workflow = { id: "w", mode: "parallel", provider: "p", modelId: "m", thinkingLevel: "medium", cwd: repo, status: "failed", tasks: [task("running", "j1"), task("aborted")] } as any;
+    const state = { workflows: [workflow], jobs: [{ id: "j1", workflowId: "w", taskIndex: 0, role: "worker", prompt: "t", conversationId: 99, submissionId: 1, status: "running" }] } as any;
+    const text = await describeWorkflow(runtime, workflow, state, new Map([[99, { taskId: 12, conversationId: 99, command: "rm -rf build", reason: "recursive or forced rm" }]]));
+    assert.match(text, /worker \[awaiting approval\]/);
+    assert.match(text, /guards-approve teamwork:12/);
+    assert.match(text, /1 running, 0 queued/);
+    assert.match(text, /: 1 uncommitted file\b/);
+    await closeDurableRuntime(ctx, "pi-teamwork-test");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("roles may list the read-only grep and find tools, which search without a shell", async () => {
+  const { SearchTools } = await import("./search-tools.ts");
+  const { NodeExecutionEnv } = await import("@earendil-works/pi-durable/env/node");
+  const tool = (name: string) => SearchTools.tools!.find((item) => item.name === name)! as any;
+  const api = { env: new NodeExecutionEnv({ cwd: process.cwd() }) } as any;
+  const text = async (name: string, args: object) => (await tool(name).execute(args, api, BACKGROUND_CONTEXT)).output[0].text as string;
+  assert.match(await text("grep", { pattern: "roles may list the read-only", glob: "*.test.ts" }), /durable-runtime\.test\.ts:\d+:/);
+  assert.equal(await text("grep", { pattern: "$(touch pwned)", fixed: true, path: "README.md" }), "(no matches)");
+  assert.match(await text("find", { pattern: "^search-tools\\.ts$" }), /search-tools\.ts/);
 });

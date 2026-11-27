@@ -5,6 +5,9 @@ import type { JsonValue } from "@earendil-works/chord/json";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { defineDoc, type CompactionSettings, type ConversationId, type Extension, type SubmissionId, type ToolRegistration } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { SearchTools } from "./search-tools.ts";
 import { getDurableRuntime, closeDurableRuntime, hasDurableRuntime, type DurableRuntime } from "./durable-runtime.ts";
 import { assistantText } from "./workflow-utils.ts";
 import { activeTaskSlots, cancelWorkflow, nextPendingTask, settleWorkflowTask } from "./workflow-state.ts";
@@ -18,19 +21,20 @@ type Workflow = { id: string; mode: "single" | "parallel" | "chain"; provider: s
 type Role = { instructions: string; tools: string[] };
 export type WorkflowsState = { jobs: Job[]; workflows: Workflow[]; roles?: Record<string, Role> } & Record<string, JsonValue>;
 export const Workflows = defineDoc<WorkflowsState>({ kind: "teamwork.workflows", version: 1, scope: "session", initial: () => ({ jobs: [], workflows: [] }), checkpointWhen: (_value, _ops, info) => info.deltasSinceBase > 32 });
-const durableTools = CodingTools.tools as ToolRegistration[];
+const durableTools = [...CodingTools.tools ?? [], ...SearchTools.tools ?? []] as ToolRegistration[];
 const toolsByName = new Map(durableTools.map((tool) => [tool.name, tool]));
 const DEFAULT_ROLES = new Map<string, Role>([
   ["scout", { instructions: "Inspect and report evidence; do not change files.", tools: ["read"] }],
   ["worker", { instructions: "Complete only the assigned task. Report changed files and verification.", tools: ["read", "bash", "edit", "write"] }],
   ["reviewer", { instructions: "Review the requested change. Do not edit files; report concrete findings.", tools: ["read"] }],
 ]);
-const RoleSchema = Type.Object({ name: Type.String({ minLength: 1, maxLength: 48 }), instructions: Type.String({ minLength: 1, maxLength: 8000 }), tools: Type.Optional(Type.Array(Type.String())) });
+const RoleSchema = Type.Object({ name: Type.String({ minLength: 1, maxLength: 48 }), instructions: Type.String({ minLength: 1, maxLength: 8000 }), tools: Type.Optional(Type.Array(Type.String({ description: `One of ${[...toolsByName.keys()].join(", ")}` }))) });
+const StatusSchema = Type.Object({ workflowId: Type.Optional(Type.String({ description: "One workflow; omitted: every workflow still running, else the latest" })) });
 const WorkSchema = Type.Object({ mode: Type.Union([Type.Literal("single"), Type.Literal("parallel"), Type.Literal("chain")]), review: Type.Optional(Type.Boolean({ description: "A reviewer conversation checks each answer and may send the worker back, at most twice." })), testCommand: Type.Optional(Type.String({ maxLength: 500, description: "Shell command run after a worker edits files; a failure sends the worker back, at most twice." })), tasks: Type.Array(Type.Object({ role: Type.String({ minLength: 1, maxLength: 48 }), task: Type.String({ minLength: 1, maxLength: 12000 }) }), { minItems: 1, maxItems: MAX_TASKS }) });
 
 
 function roleTools(names: string[]) {
-  if (names.some((name) => !toolsByName.has(name))) throw new Error("Role tools must be selected from read, write, edit, bash");
+  if (names.some((name) => !toolsByName.has(name))) throw new Error(`Role tools must be selected from ${[...toolsByName.keys()].join(", ")}`);
   return names.map((name) => toolsByName.get(name)!);
 }
 async function settleJob(runtime: DurableRuntime, job: Job) {
@@ -181,10 +185,11 @@ export async function cancelWorkflows(runtime: DurableRuntime, ids?: Set<string>
   }, BACKGROUND_CONTEXT);
 }
 /** pi-guards, when installed: its contract on globalThis (see that package's registry.ts). */
-type GuardsHost = { version: 1; extensions(host: string): readonly Extension[]; init(config: { review?: boolean; testCommand?: string }): ((tx: any, id: any) => Promise<void>) | undefined; opened(host: string, harness: unknown): void; closed(host: string): void };
+type ParkedCall = { taskId: number; conversationId: number; command: string; reason: string };
+type GuardsHost = { version: 1; extensions(host: string): readonly Extension[]; init(config: { review?: boolean; testCommand?: string }): ((tx: any, id: any) => Promise<void>) | undefined; opened(host: string, harness: unknown): void; closed(host: string): void; pending(host: string): Promise<readonly ParkedCall[]> };
 const guards = () => { const host = (globalThis as Record<symbol, GuardsHost | undefined>)[Symbol.for("pi-guards.host")]; return host?.version === 1 ? host : undefined; };
 async function openRuntime(ctx: ExtensionContext) {
-  const runtime = await getDurableRuntime(ctx, "pi-teamwork", [CodingTools, ...(guards()?.extensions("teamwork") ?? [])] as Extension<ToolRegistration>[]);
+  const runtime = await getDurableRuntime(ctx, "pi-teamwork", [CodingTools, SearchTools, ...(guards()?.extensions("teamwork") ?? [])] as Extension<ToolRegistration>[]);
   guards()?.opened("teamwork", runtime.harness);
   return runtime;
 }
@@ -201,21 +206,84 @@ function workerCompaction(pi: ExtensionAPI) {
   const compaction = pi.getSettings().compaction as (CompactionSettings & JsonValue) | undefined;
   return compaction ? { compaction } : {};
 }
+const run = promisify(execFile);
+const preview = (text: string, max = 160) => { const flat = text.replace(/\s+/g, " ").trim(); return flat.length > max ? `${flat.slice(0, max - 3)}...` : flat; };
+const parkedByConversation = async () => new Map(((await guards()?.pending("teamwork").catch(() => [])) ?? []).map((call) => [call.conversationId, call]));
+const queueLine = (state: Readonly<WorkflowsState>) => {
+  const running = state.jobs.filter((job) => job.status === "running").length;
+  const queued = state.workflows.filter((workflow) => workflow.status === "running").reduce((count, workflow) => count + (workflow.mode === "chain" ? Number(workflow.tasks.some((task) => task.status === "pending")) : workflow.tasks.filter((task) => task.status === "pending").length), 0);
+  return `${running} running, ${queued} queued (at most ${MAX_CONCURRENCY} at once)`;
+};
+
+/** Each git worktree of the repository at `cwd` with uncommitted changes, so a stopped worker's partial work is not lost. */
+export async function uncommittedWork(cwd: string): Promise<string[]> {
+  const list = await run("git", ["-C", cwd, "worktree", "list", "--porcelain"]).catch(() => undefined);
+  if (!list) return [];
+  const paths = list.stdout.split("\n").filter((line) => line.startsWith("worktree ")).map((line) => line.slice(9));
+  const dirty = await Promise.all(paths.map(async (path) => {
+    const files = (await run("git", ["-C", path, "status", "--porcelain"]).catch(() => ({ stdout: "" }))).stdout.split("\n").filter(Boolean).length;
+    return files ? `${path}: ${files} uncommitted file${files === 1 ? "" : "s"}` : undefined;
+  }));
+  return dirty.filter((line) => line !== undefined);
+}
+
+/** What a workflow's tasks are doing: status, a parked approval, the last tool call and when the worker last wrote. */
+export async function describeWorkflow(runtime: DurableRuntime, workflow: Readonly<Workflow>, state: Readonly<WorkflowsState>, parked: Map<number, ParkedCall>) {
+  const lines = [`Workflow ${workflow.id} · ${workflow.mode} · ${workflow.status}${workflow.error ? ` · ${workflow.error}` : ""} · ${queueLine(state)}`];
+  for (const [index, task] of workflow.tasks.entries()) {
+    const job = state.jobs.find((item) => item.id === task.jobId);
+    const approval = job && task.status === "running" ? parked.get(job.conversationId) : undefined;
+    lines.push(`${index + 1}. ${task.role} [${approval ? "awaiting approval" : task.status}]${job ? ` job ${job.id}` : ""}${task.error ? ` · ${task.error}` : ""}`);
+    if (approval) lines.push(`   waits for /guards-approve teamwork:${approval.taskId} or /guards-deny teamwork:${approval.taskId} (${approval.reason}): ${preview(approval.command)}`);
+    if (!job || task.status !== "running") continue;
+    const conversation = await runtime.harness.conversation(job.conversationId as ConversationId, BACKGROUND_CONTEXT);
+    const recent = conversation ? (await conversation.entries({}, 20, undefined, BACKGROUND_CONTEXT)).items : [];
+    const stamped = recent.flatMap((entry) => entry.model ?? []).find((message) => typeof (message as { timestamp?: unknown }).timestamp === "number") as { timestamp: number } | undefined;
+    const call = recent.flatMap((entry) => entry.model ?? []).flatMap((message) => message.role === "assistant" ? message.content.filter((part) => part.type === "toolCall").reverse() : []).at(0);
+    if (stamped) lines.push(`   last activity ${Math.round((Date.now() - stamped.timestamp) / 1000)}s ago`);
+    if (call) lines.push(`   last tool call: ${call.name} ${preview(JSON.stringify(call.arguments))}`);
+  }
+  if (workflow.tasks.some((task) => task.status === "failed" || task.status === "aborted")) {
+    const dirty = await uncommittedWork(workflow.cwd);
+    if (dirty.length) lines.push("Uncommitted changes, possibly a stopped worker's partial work:", ...dirty.map((line) => `  ${line}`));
+  }
+  return lines.join("\n");
+}
+
+export async function workflowStatus(runtime: DurableRuntime, id?: string) {
+  const state = await runtime.harness.snapshot(Workflows, BACKGROUND_CONTEXT);
+  if (!state?.workflows.length) return "No teamwork workflows.";
+  const active = state.workflows.filter((workflow) => workflow.status === "running" || workflow.status === "cancelling");
+  const chosen = id ? state.workflows.filter((workflow) => workflow.id === id) : active.length ? active : state.workflows.slice(-1);
+  if (!chosen.length) throw new Error(`Unknown workflow ${id}`);
+  const parked = await parkedByConversation();
+  return (await Promise.all(chosen.map((workflow) => describeWorkflow(runtime, workflow, state, parked)))).join("\n\n");
+}
+
+const APPROVAL_POLL_MS = 15_000;
 export async function waitForWorkflow(runtime: DurableRuntime, id: string, signal: AbortSignal | undefined, onUpdate?: (event: any) => void) {
-  const stopped = "Stopped waiting; the durable workflow continues in the background. Use /teamwork cancel to cancel it.";
+  const stopped = `Stopped waiting; durable workflow ${id} continues in the background. Check it with teamwork_status, or cancel it with /teamwork cancel.`;
   const watch = await runtime.harness.watchDoc(Workflows, BACKGROUND_CONTEXT);
   if (!watch) throw new Error("Workflow record disappeared");
   return await new Promise<Workflow>((resolve, reject) => {
-    let done = false, last = "";
-    const finish = (error?: Error, workflow?: Workflow) => { if (done) return; done = true; signal?.removeEventListener("abort", abort); void watch.stop(); if (error) reject(error); else resolve(workflow!); };
+    let done = false, last = "", parked = new Map<number, ParkedCall>();
+    const finish = (error?: Error, workflow?: Workflow) => { if (done) return; done = true; clearInterval(poll); signal?.removeEventListener("abort", abort); void watch.stop(); if (error) reject(error); else resolve(workflow!); };
     const abort = () => finish(new Error(stopped));
     const check = (state: Readonly<WorkflowsState>) => {
+      if (done) return;
       const workflow = state.workflows.find((item) => item.id === id);
       if (!workflow) return finish(new Error("Workflow record disappeared"));
-      const progress = `${workflow.status}:${workflow.tasks.map((task) => task.status).join(",")}`;
-      if (progress !== last) { last = progress; onUpdate?.({ content: [{ type: "text", text: `Teamwork ${id}: ${workflow.status}` }], details: workflow }); }
+      const tasks = workflow.tasks.map((task, index) => {
+        const approval = task.status === "running" ? parked.get(state.jobs.find((job) => job.id === task.jobId)?.conversationId ?? -1) : undefined;
+        return approval ? `${index + 1}. ${task.role} awaiting approval: /guards-approve teamwork:${approval.taskId} (${approval.reason}): ${preview(approval.command, 100)}` : `${index + 1}. ${task.role} ${task.status}`;
+      });
+      const progress = `${workflow.status}\n${tasks.join("\n")}`;
+      if (progress !== last) { last = progress; onUpdate?.({ content: [{ type: "text", text: `Teamwork ${id}: ${workflow.status} · ${queueLine(state)}\n${tasks.join("\n")}` }], details: workflow }); }
       if (workflow.status !== "running" && workflow.status !== "cancelling" && !workflow.tasks.some((task) => task.status === "running")) finish(undefined, workflow as Workflow);
     };
+    // A parked approval changes no workflow record, so poll the guards for it.
+    const poll = setInterval(() => void parkedByConversation().then((next) => { parked = next; check(watch.value); }).catch(() => {}), APPROVAL_POLL_MS);
+    poll.unref?.();
     if (signal?.aborted) return abort();
     signal?.addEventListener("abort", abort, { once: true });
     void watch.closed.then(() => finish(new Error(stopped)));
@@ -262,15 +330,23 @@ export default function (pi: ExtensionAPI) {
       }, BACKGROUND_CONTEXT);
       await requestDrive(runtime);
       const result = await waitForWorkflow(runtime, workflow.id, signal, onUpdate);
-      return { content: [{ type: "text", text: result.tasks.map((task, index) => `### ${index + 1}. ${task.role} [${task.status}]${task.error ? `\nError: ${task.error}` : ""}\n${task.output ?? "(no output)"}`).join("\n\n") }], details: { mode: result.mode, workflowId: result.id, status: result.status, error: result.error, tasks: result.tasks } };
+      const dirty = result.status === "done" ? [] : await uncommittedWork(result.cwd);
+      const report = result.tasks.map((task, index) => `### ${index + 1}. ${task.role} [${task.status}]${task.error ? `\nError: ${task.error}` : ""}\n${task.output ?? "(no output)"}`).join("\n\n");
+      return { content: [{ type: "text", text: `${report}${dirty.length ? `\n\nUncommitted changes, possibly a stopped worker's partial work:\n${dirty.join("\n")}` : ""}` }], details: { mode: result.mode, workflowId: result.id, status: result.status, error: result.error, tasks: result.tasks, uncommitted: dirty } };
+    },
+  });
+  pi.registerTool({
+    name: "teamwork_status", label: "Teamwork Status", description: "Report what durable teamwork workflows are doing now: each task's status, a command parked on approval, the last tool call and activity time, the queue, and uncommitted changes left by stopped workers. Use it instead of waiting blind or reading the database.", parameters: StatusSchema,
+    async execute(_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) {
+      if (!(await hasDurableRuntime(ctx, "pi-teamwork"))) return { content: [{ type: "text", text: "No teamwork workflows." }], details: {} };
+      return { content: [{ type: "text", text: await workflowStatus(await openRuntime(ctx), params.workflowId) }], details: {} };
     },
   });
   pi.registerCommand("teamwork", { description: "Run, list, or cancel Durable Pi subagents", handler: async (args, ctx) => {
     const runtime = await openRuntime(ctx);
     const input = args.trim();
     if (input === "status" || !input) {
-      const state = await runtime.harness.snapshot(Workflows, BACKGROUND_CONTEXT);
-      ctx.ui.notify(state?.workflows.length ? state.workflows.map((workflow) => `${workflow.id} · ${workflow.mode} · ${workflow.status}`).join("\n") : "No teamwork workflows.", "info");
+      ctx.ui.notify(await workflowStatus(runtime), "info");
     } else if (input === "cancel") {
       await cancelWorkflows(runtime);
       ctx.ui.notify("Cancellation requested for active Durable workflows.", "info");
